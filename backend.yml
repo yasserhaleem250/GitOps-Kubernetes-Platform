@@ -1,0 +1,67 @@
+name: Build and Push Backend
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          version: 'latest'
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ secrets.WIP }}
+          service_account: ${{ secrets.SERVICE_ACCOUNT }}
+
+      - name: Configure Docker to use gcloud
+        run: gcloud auth configure-docker gcr.io
+
+      - name: Build Docker image
+        working-directory: ./backend
+        run: |
+          docker build -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/backend:${{ github.sha }} \
+                       -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/backend:latest \
+                       .
+
+      - name: Push Docker image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/backend:${{ github.sha }}
+          docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/backend:latest
+
+      - name: Update image in manifest
+        if: github.ref == 'refs/heads/main'
+        run: |
+          sed -i "s|gcr.io/${{ secrets.GCP_PROJECT_ID }}/backend:latest|gcr.io/${{ secrets.GCP_PROJECT_ID }}/backend:${{ github.sha }}|g" kubernetes/backend-deployment.yaml
+
+      - name: Commit and push updated manifest
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add kubernetes/backend-deployment.yaml
+          git commit -m "Update backend image to ${{ github.sha }}" || echo "No changes to commit"
+          git push
