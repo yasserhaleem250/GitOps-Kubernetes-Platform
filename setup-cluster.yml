@@ -1,0 +1,115 @@
+---
+- name: Setup GKE Cluster with Argo CD and Linkerd
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    cluster_name: gitops-cluster
+    gcp_region: us-central1
+    gcp_project: "{{ gcp_project_id }}"
+    argocd_namespace: argocd
+    linkerd_namespace: linkerd
+    linkerd_version: stable-2.14.0
+
+  tasks:
+    - name: Get GKE cluster credentials
+      shell: |
+        gcloud container clusters get-credentials {{ cluster_name }} \
+          --region {{ gcp_region }} \
+          --project {{ gcp_project }}
+      environment:
+        PATH: "{{ ansible_env.PATH }}:/usr/local/bin"
+
+    - name: Create namespaces
+      kubernetes.core.k8s:
+        name: "{{ item }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+      loop:
+        - "{{ argocd_namespace }}"
+        - "{{ linkerd_namespace }}"
+        - default
+
+    - name: Add Helm repositories
+      kubernetes.core.helm_repository:
+        name: "{{ item.name }}"
+        repo_url: "{{ item.url }}"
+        state: present
+      loop:
+        - name: argoproj
+          url: https://argoproj.github.io/argo-helm
+        - name: linkerd
+          url: https://helm.linkerd.io
+
+    - name: Install Argo CD
+      kubernetes.core.helm:
+        name: argocd
+        chart_ref: argoproj/argo-cd
+        release_namespace: "{{ argocd_namespace }}"
+        create_namespace: yes
+        values:
+          global:
+            domain: argocd.example.com
+          configs:
+            secret:
+              argocdServerAdminPassword: "$2a$10$9nyVIHkYrn.YSOWJ15bOK.A9qZnUNqnPg6QhGYbp9R8BxGc6PShsy"
+          server:
+            service:
+              type: LoadBalancer
+
+    - name: Install Linkerd
+      kubernetes.core.helm:
+        name: linkerd
+        chart_ref: linkerd/linkerd2
+        release_namespace: "{{ linkerd_namespace }}"
+        create_namespace: yes
+        values:
+          installNamespace: true
+          identity:
+            issuer:
+              scheme: kubernetes.io/tls
+
+    - name: Wait for Argo CD to be ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ argocd_namespace }}"
+        name: argocd-server
+        wait: yes
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_sleep: 10
+        wait_timeout: 300
+
+    - name: Get Argo CD initial password
+      kubernetes.core.k8s_info:
+        kind: Secret
+        namespace: "{{ argocd_namespace }}"
+        name: argocd-initial-admin-secret
+      register: argocd_secret
+
+    - name: Display Argo CD information
+      debug:
+        msg:
+          - "Argo CD has been installed successfully!"
+          - "Namespace: {{ argocd_namespace }}"
+          - "Get the admin password with: kubectl get secret -n {{ argocd_namespace }} argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+
+    - name: Create Kubernetes service account for Argo CD
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: app-ksa
+            namespace: default
+
+    - name: Bind Workload Identity
+      shell: |
+        kubectl annotate serviceaccount app-ksa \
+          iam.gke.io/gcp-service-account=gitops-cluster-app@{{ gcp_project }}.iam.gserviceaccount.com \
+          --namespace default \
+          --overwrite
+      environment:
+        PATH: "{{ ansible_env.PATH }}:/usr/local/bin"
